@@ -22,7 +22,15 @@ ssh root@<your-server-ip>
 apt update && apt upgrade -y
 
 # Install required packages
-apt install -y git golang-go nginx certbot python3-certbot-nginx sqlite3 build-essential unzip
+apt install -y git golang-go nginx build-essential unzip
+
+# Install certbot via snap (not available in apt on Ubuntu 25.04+)
+snap install --classic certbot
+ln -s /snap/bin/certbot /usr/bin/certbot
+
+# Optional: install sqlite3 CLI for debugging the database
+# (not required — the node statically compiles SQLite)
+apt install -y sqlite3 || true
 
 # Verify Go version (should be 1.21+)
 go version
@@ -108,6 +116,7 @@ Key fields to customize in `config.json`:
 | `admin_npub` | *(empty)* | Your npub — enables the Awareness tab in the dashboard |
 | `dns.enabled` | `true` | Enable DNS server (port 53 requires root) |
 | `enable_awareness` | `true` | Enable the awareness filtering system |
+| `announce_addresses` | *(empty)* | List of addresses to announce to the network |
 
 ## Part 3: Create Systemd Service
 
