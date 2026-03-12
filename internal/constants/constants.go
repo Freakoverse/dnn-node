@@ -11,13 +11,13 @@ const (
 // The first DNN block (block 0) is anchored to this Bitcoin block
 const (
 	// Production genesis (when Bitcoin reaches block 1,000,000)
-	GenesisBlockMainnet = 1000000
+	GenesisBlockMainnet = 940000
 
 	// Testnet genesis (Bitcoin block 932,300)
-	GenesisBlockTestnet = 932300
+	GenesisBlockTestnet = 940000
 
 	// Development genesis (for faster local testing)
-	GenesisBlockDev = 900000
+	GenesisBlockDev = 940000
 )
 
 // Fee rate policy (in satoshis per vByte)
