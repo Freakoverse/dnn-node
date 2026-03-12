@@ -3004,10 +3004,10 @@
         function showNostrOptions() {
             document.getElementById('nostrConnectOptions').classList.remove('hidden');
             document.getElementById('nostrRemoteView').classList.add('hidden');
-            // Clean up any pending remote signer connection
-            if (window.remoteSignerWs) {
-                window.remoteSignerWs.close();
-                window.remoteSignerWs = null;
+            // Clean up any pending remote signer connections
+            if (window.remoteSignerWsList) {
+                window.remoteSignerWsList.forEach(ws => { try { ws.close(); } catch(e) {} });
+                window.remoteSignerWsList = [];
             }
             lucide.createIcons();
         }
@@ -3808,71 +3808,75 @@
         function subscribeForConnectResponse() {
             console.log('Subscribing for connect response on relays:', NIP46_RELAYS);
 
-            // Close existing connection if any
-            if (window.remoteSignerWs) {
-                window.remoteSignerWs.close();
+            // Close existing connections if any
+            if (window.remoteSignerWsList) {
+                window.remoteSignerWsList.forEach(ws => { try { ws.close(); } catch(e) {} });
             }
+            window.remoteSignerWsList = [];
 
-            // Try connecting to the first relay
-            const relay = NIP46_RELAYS[0];
+            // Connect to ALL relays in parallel (signer may respond on any of them)
+            NIP46_RELAYS.forEach(relay => {
+                try {
+                    const ws = new WebSocket(relay);
+                    window.remoteSignerWsList.push(ws);
 
-            try {
-                const ws = new WebSocket(relay);
-                window.remoteSignerWs = ws;
+                    const subscriptionId = 'nip46_' + generateRandomHex(8);
 
-                const subscriptionId = 'nip46_' + generateRandomHex(8);
+                    ws.onopen = () => {
+                        console.log('Connected to relay for NIP-46:', relay);
 
-                ws.onopen = () => {
-                    console.log('Connected to relay for NIP-46:', relay);
+                        // Subscribe to kind 24133 events tagged to our client pubkey
+                        const req = JSON.stringify([
+                            'REQ',
+                            subscriptionId,
+                            {
+                                kinds: [24133],
+                                '#p': [remoteSignerClientPubkey],
+                                since: Math.floor(Date.now() / 1000) - 60
+                            }
+                        ]);
+                        ws.send(req);
+                        console.log('Sent NIP-46 subscription:', req);
+                    };
 
-                    // Subscribe to kind 24133 events tagged to our client pubkey
-                    const req = JSON.stringify([
-                        'REQ',
-                        subscriptionId,
-                        {
-                            kinds: [24133],
-                            '#p': [remoteSignerClientPubkey],
-                            since: Math.floor(Date.now() / 1000) - 60
+                    ws.onmessage = (event) => {
+                        try {
+                            const msg = JSON.parse(event.data);
+                            console.log('NIP-46 relay message:', msg);
+
+                            if (msg[0] === 'EVENT' && msg[2]) {
+                                handleNip46Event(msg[2]);
+                                // Close all relay connections once we got a response
+                                if (window.remoteSignerWsList) {
+                                    window.remoteSignerWsList.forEach(w => { try { w.close(); } catch(e) {} });
+                                    window.remoteSignerWsList = [];
+                                }
+                            }
+                        } catch (e) {
+                            console.error('Error parsing relay message:', e);
                         }
-                    ]);
-                    ws.send(req);
-                    console.log('Sent NIP-46 subscription:', req);
-                };
+                    };
 
-                ws.onmessage = (event) => {
-                    try {
-                        const msg = JSON.parse(event.data);
-                        console.log('NIP-46 relay message:', msg);
+                    ws.onerror = (error) => {
+                        console.error('NIP-46 WebSocket error on', relay, ':', error);
+                    };
 
-                        if (msg[0] === 'EVENT' && msg[2]) {
-                            handleNip46Event(msg[2]);
+                    ws.onclose = () => {
+                        console.log('NIP-46 WebSocket closed:', relay);
+                    };
+
+                    // Timeout after 5 minutes (300 seconds)
+                    setTimeout(() => {
+                        if (ws.readyState === WebSocket.OPEN && !window.userNpub) {
+                            console.log('NIP-46 connection timeout on:', relay);
+                            ws.close();
                         }
-                    } catch (e) {
-                        console.error('Error parsing relay message:', e);
-                    }
-                };
+                    }, 300000);
 
-                ws.onerror = (error) => {
-                    console.error('NIP-46 WebSocket error:', error);
-                };
-
-                ws.onclose = () => {
-                    console.log('NIP-46 WebSocket closed');
-                };
-
-                // Timeout after 5 minutes (300 seconds)
-                setTimeout(() => {
-                    if (ws.readyState === WebSocket.OPEN && !window.userNpub) {
-                        console.log('NIP-46 connection timeout');
-                        ws.close();
-                        // Don't show error - user might still be scanning
-                    }
-                }, 300000);
-
-            } catch (error) {
-                console.error('Failed to connect to relay:', error);
-                showRemoteSignerError('Failed to connect to relay: ' + error.message);
-            }
+                } catch (error) {
+                    console.error('Failed to connect to relay:', relay, error);
+                }
+            });
         }
 
         // Handle NIP-46 event (kind 24133)

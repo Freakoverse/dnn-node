@@ -58,8 +58,10 @@ The embedded web dashboard provides:
 ## 📁 Project Structure
 
 ```
-node/
+dnn-node/
 ├── main.go                 # Entry point
+├── DEPLOYMENT.md           # Production deployment guide
+├── config.example.json     # Example configuration
 ├── internal/               # Core Go packages
 │   ├── node/              # Main server + embedded dashboard
 │   ├── sync/              # Bitcoin and peer sync
@@ -74,9 +76,7 @@ node/
 ├── cmd/                   # Command-line tools
 │   ├── dnn-cli/          # CLI tool
 │   └── test-client/      # Test client
-├── docs/                  # Documentation
-├── scripts/               # Setup scripts
-└── test/                  # Test files
+└── scripts/               # Setup scripts
 ```
 
 ---
@@ -174,13 +174,8 @@ The node's awareness system allows operators to `block` specific TLDs or names. 
 
 ## 📖 Documentation
 
-### Core Documentation
-- **[DNN Overview](../docs/DNN_OVERVIEW.md)** - Comprehensive DNN protocol explanation
-- **[NIP-DN Specification](../docs/NIP-DN.md)** - Technical specification
-- **[Node Policy](../docs/node_policy.md)** - DNN node rules and requirements
-
-### Deployment & Operations
-- **[Deployment Guide](../docs/DEPLOYMENT.md)** - Production deployment instructions
+- **[Deployment Guide](DEPLOYMENT.md)** — Production deployment (fresh server to production)
+- **[Config Example](config.example.json)** — All available configuration options
 
 ---
 
@@ -203,9 +198,9 @@ go test ./internal/validation/
 ## 📝 DNN Protocol Summary
 
 ### Networks
-- **Mainnet**: Genesis at Bitcoin block 1,000,000
-- **Testnet**: Genesis at Bitcoin block 932,300
-- **Dev**: Genesis at Bitcoin block 900,000
+- **Mainnet**: Genesis at Bitcoin block 940,000
+- **Testnet**: Genesis at Bitcoin block 940,000
+- **Dev**: Genesis at Bitcoin block 940,000
 
 ### Registration Requirements
 - Self-transfer Bitcoin transaction (sender = receiver, P2WPKH only)
@@ -225,7 +220,7 @@ go test ./internal/validation/
 | 60600 | Anchor — links Bitcoin TX to Nostr events |
 | 61600 | Name — declares the name(s) |
 | 62600 | Connection — DNS records, IP addresses, certs |
-| 63600 | Metadata — display name, avatar, bio |
+| 63600 | Metadata — description, relays, currencies, addresses |
 | 64600 | Node Discovery — peer node announcements |
 
 ---
