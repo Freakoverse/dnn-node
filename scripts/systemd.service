@@ -1,0 +1,33 @@
+[Unit]
+Description=DNN Node Service
+Documentation=https://github.com/freakoverse/godnn
+After=network.target
+
+[Service]
+Type=simple
+User=dnn
+Group=dnn
+WorkingDirectory=/opt/dnn-node
+ExecStart=/opt/dnn-node/dnn-node
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dnn-node/data
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnn-node
+
+# Resource limits
+LimitNOFILE=4096
+MemoryLimit=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target

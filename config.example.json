@@ -1,0 +1,39 @@
+{
+  "node_private_key": "GENERATED_ON_INIT",
+  "node_pubkey": "GENERATED_ON_INIT",
+  "node_npub": "GENERATED_ON_INIT",
+  "network": "testnet",
+  "_network_options": "mainnet (Bitcoin 1,000,000), testnet (Bitcoin 932,300), dev (Bitcoin 900,000)",
+  "port": 8080,
+  "data_dir": "./data",
+  "relay_urls": [
+    "wss://relay.damus.io",
+    "wss://relay.nostr.band",
+    "wss://nos.lol",
+    "wss://relay.primal.net"
+  ],
+  "peer_nodes": [],
+  "bitcoin_rpc": {
+    "use_p2p": true,
+    "p2p_peers": [],
+    "_comment": "P2P mode connects directly to the Bitcoin network. Leave p2p_peers empty to use DNS seeds."
+  },
+  "dns": {
+    "enabled": true,
+    "port": 53,
+    "upstream_dns": [
+      "8.8.8.8:53",
+      "1.1.1.1:53"
+    ],
+    "cache_ttl": 300,
+    "query_timeout": 5,
+    "_comment": "Port 53 requires administrator/root privileges. If binding fails, HTTP API is still available."
+  },
+  "sync_interval": 60,
+  "block_batch_size": 5,
+  "max_connections": 1000,
+  "enable_awareness": true,
+  "admin_npub": "YOUR_NPUB_HERE",
+  "announce_addresses": [],
+  "_announce_comment": "Add your node's public URL(s) here for auto-announcement, e.g. [\"https://your-node.example.com\"]"
+}

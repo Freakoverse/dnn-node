@@ -1,0 +1,104 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+dnn-node
+dnn
+
+# Daemon binaries (served via GitHub releases)
+internal/node/dashboard/static/downloads/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment files
+.env
+.env.local
+
+# Configuration files with sensitive data
+config.json
+!config.example.json
+
+# Data directory
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE specific files
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+*.sublime-workspace
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+
+# Docker volumes
+docker-data/
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+
+# Air (hot reload tool) temporary files
+tmp/
+
+# Node.js (React frontend - if used)
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# TLS certificates (generated locally)
+certs/
+
+# AI agent config files
+AGENTS.md
+.mcp.json
+
+# GitHub workflows (not needed)
+.github/
+
+# CI/CD (not needed for GitHub)
+.gitlab-ci.yml
+
+# Local deployment config
+stack.json
+
+# Development prototypes
+dashboard-prototype.html
+
+# Test directory (broken imports)
+test/

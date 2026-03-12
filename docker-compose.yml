@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  dnn-node:
+    build: .
+    container_name: dnn-node
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/home/dnn/data
+      - ./config.json:/home/dnn/config.json
+    environment:
+      - DNN_PORT=8080
+      - DNN_DATA_DIR=/home/dnn/data
+    networks:
+      - dnn-network
+    restart: unless-stopped
+    depends_on:
+      - bitcoin
+
+  bitcoin:
+    image: btcpayserver/bitcoin:25.0
+    container_name: bitcoin-node
+    volumes:
+      - bitcoin-data:/data
+    environment:
+      BITCOIN_NETWORK: mainnet
+      BITCOIN_EXTRA_ARGS: |
+        server=1
+        rpcuser=bitcoin
+        rpcpassword=changeme
+        rpcallowip=172.0.0.0/8
+        rpcbind=0.0.0.0
+        zmqpubrawblock=tcp://0.0.0.0:28332
+        zmqpubrawtx=tcp://0.0.0.0:28333
+    ports:
+      - "8332:8332"  # RPC
+      - "8333:8333"  # P2P
+      - "28332:28332" # ZMQ
+      - "28333:28333" # ZMQ
+    networks:
+      - dnn-network
+    restart: unless-stopped
+
+  # Optional: Add a web interface for monitoring
+  dnn-web:
+    image: nginx:alpine
+    container_name: dnn-web
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+    ports:
+      - "80:80"
+    networks:
+      - dnn-network
+    restart: unless-stopped
+    profiles:
+      - web
+
+networks:
+  dnn-network:
+    driver: bridge
+
+volumes:
+  bitcoin-data:
