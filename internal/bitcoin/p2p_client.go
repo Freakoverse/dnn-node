@@ -185,7 +185,7 @@ func (p *P2PClient) connectToPeer(addr string) error {
 		UserAgentName:    "DNN-Node",
 		UserAgentVersion: "0.1.0",
 		ChainParams:      p.network,
-		Services:         wire.SFNodeNetwork,
+		Services:         wire.SFNodeNetwork | wire.SFNodeWitness,
 		TrickleInterval:  time.Second * 10,
 		Listeners: peer.MessageListeners{
 			OnBlock:   p.onBlock,
@@ -954,7 +954,7 @@ func (p *P2PClient) requestBlockFromPeer(selectedPeer *peer.Peer, peerAddr strin
 
 	// Send getdata message to request the block
 	getData := wire.NewMsgGetData()
-	inv := wire.NewInvVect(wire.InvTypeBlock, hash)
+	inv := wire.NewInvVect(wire.InvTypeWitnessBlock, hash)
 	if err := getData.AddInvVect(inv); err != nil {
 		return nil, fmt.Errorf("failed to add inv vect: %w", err)
 	}

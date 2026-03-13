@@ -465,6 +465,8 @@ func (s *Syncer) findValidDNNTransactions(block *bitcoin.Block) []ValidDNNTransa
 // Returns: (bitcoinAddress, isValid)
 // DNN criteria: valid self-transfer (all inputs and outputs have same P2WPKH address)
 func (s *Syncer) isValidDNNTransaction(tx *bitcoin.Transaction) (string, bool) {
+	txid := tx.TxID
+
 	// Must have at least one input and output
 	if len(tx.Inputs) == 0 || len(tx.Outputs) == 0 {
 		return "", false
@@ -495,6 +497,7 @@ func (s *Syncer) isValidDNNTransaction(tx *bitcoin.Transaction) (string, bool) {
 		// ONLY allow P2WPKH outputs - reject everything else
 		// btcd returns "witness_v0_keyhash" for P2WPKH (bc1q) addresses
 		if scriptType != "witness_v0_keyhash" {
+			log.Printf("[DNN-DEBUG] TX %s rejected: output type '%s' != 'witness_v0_keyhash'", txid[:16], scriptType)
 			return "", false
 		}
 
@@ -511,6 +514,7 @@ func (s *Syncer) isValidDNNTransaction(tx *bitcoin.Transaction) (string, bool) {
 
 	// DNN requires exactly ONE unique address across all inputs and outputs (self-transfer)
 	if len(allAddresses) != 1 {
+		log.Printf("[DNN-DEBUG] TX %s rejected: %d unique addresses (need 1). Inputs: %v, Outputs: %v", txid[:16], len(allAddresses), inputAddresses, outputAddresses)
 		return "", false
 	}
 
@@ -529,6 +533,7 @@ func (s *Syncer) isValidDNNTransaction(tx *bitcoin.Transaction) (string, bool) {
 	// DNN only accepts P2WPKH addresses (bc1q prefix)
 	// Reject taproot (bc1p), legacy (1...), P2SH (3...), and other address types
 	if !strings.HasPrefix(strings.ToLower(address), "bc1q") {
+		log.Printf("[DNN-DEBUG] TX %s rejected: address '%s' doesn't start with 'bc1q'", txid[:16], address)
 		return "", false
 	}
 
