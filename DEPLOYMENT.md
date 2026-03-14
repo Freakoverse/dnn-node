@@ -21,8 +21,16 @@ ssh root@<your-server-ip>
 # Update system
 apt update && apt upgrade -y
 
-# Install required packages
-apt install -y git golang-go nginx build-essential unzip
+# Install required packages (NOT golang-go — apt version is often outdated)
+apt install -y git nginx build-essential unzip wget
+
+# Install Go 1.24 from official source (apt's golang-go is unreliable)
+wget https://go.dev/dl/go1.24.1.linux-amd64.tar.gz
+rm -rf /usr/local/go
+tar -C /usr/local -xzf go1.24.1.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+rm go1.24.1.linux-amd64.tar.gz
 
 # Install certbot via snap (not available in apt on Ubuntu 25.04+)
 snap install --classic certbot
@@ -32,7 +40,7 @@ ln -s /snap/bin/certbot /usr/bin/certbot
 # (not required — the node statically compiles SQLite)
 apt install -y sqlite3 || true
 
-# Verify Go version (should be 1.21+)
+# Verify Go version (must be 1.24+)
 go version
 ```
 
