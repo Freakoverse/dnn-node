@@ -1,4 +1,4 @@
-﻿package database
+package database
 
 import (
 	"database/sql"
@@ -21,6 +21,47 @@ type QueryBuilder struct {
 // NewQueryBuilder creates a new query builder
 func NewQueryBuilder(db *Database) *QueryBuilder {
 	return &QueryBuilder{db: db}
+}
+
+// GetRandomBitcoinTransaction returns a random Bitcoin transaction from the database.
+// Used for peer verification spot-checks.
+func (qb *QueryBuilder) GetRandomBitcoinTransaction() (*BitcoinTransactionRecord, error) {
+	query := `
+		SELECT
+			transaction_id,
+			bitcoin_block_number,
+			dnn_block_number,
+			position,
+			bitcoin_address,
+			fee_rate,
+			discovered_at,
+			has_anchor_event,
+			COALESCE(anchor_event_id, '') as anchor_event_id
+		FROM bitcoin_transactions
+		ORDER BY RANDOM()
+		LIMIT 1
+	`
+
+	var record BitcoinTransactionRecord
+	var discoveredAt int64
+	err := qb.db.db.QueryRow(query).Scan(
+		&record.TransactionID,
+		&record.BitcoinBlock,
+		&record.DNNBlock,
+		&record.Position,
+		&record.BitcoinAddress,
+		&record.FeeRate,
+		&discoveredAt,
+		&record.HasAnchorEvent,
+		&record.AnchorEventID,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	record.DiscoveredAt = time.Unix(discoveredAt, 0)
+	return &record, nil
 }
 
 // GetBitcoinTransactionByID retrieves a Bitcoin transaction by its transaction ID

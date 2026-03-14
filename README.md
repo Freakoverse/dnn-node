@@ -8,6 +8,10 @@ A Go implementation of a DNN (Decentralized Naming Network) node that serves as 
 
 ## 🚀 Quick Start
 
+### Deploy to a server
+
+Read the DEPLOYMENT.md file to deploy a DNN node to a server
+
 ### Linux/Mac Users
 
 ```bash

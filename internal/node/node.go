@@ -1567,6 +1567,8 @@ func (n *Node) handleNodeInfo(w http.ResponseWriter, r *http.Request) {
 	info := map[string]interface{}{
 		"node_pubkey":       n.config.NodePubkey,
 		"node_npub":         n.config.NodeNpub,
+		"genesis_block":     constants.GetGenesisBlock(n.config.Network),
+		"network":           n.config.Network,
 		"relay_url":         relayURL,
 		"configured_relays": n.config.RelayURLs,
 		"configured_peers":  n.config.PeerNodes,

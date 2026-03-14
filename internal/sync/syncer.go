@@ -1954,6 +1954,7 @@ func (s *Syncer) handleNodeDiscoveryEvent(event *nostr.Event) {
 
 // verifyNodeEndpoint pings a node's /dnn/node-info endpoint to verify it's a real DNN node.
 // Returns the node's npub, pubkey, admin_pubkey, or an error. Retries up to 3 times with 10s timeouts.
+// Also verifies genesis block match and performs a random data spot-check.
 func (s *Syncer) verifyNodeEndpoint(address string) (npub string, pubkey string, adminPubkey string, err error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
@@ -1981,9 +1982,11 @@ func (s *Syncer) verifyNodeEndpoint(address string) (npub string, pubkey string,
 		}
 
 		var info struct {
-			NodeNpub   string `json:"node_npub"`
-			NodePubkey string `json:"node_pubkey"`
-			AdminNpub  string `json:"admin_npub"`
+			NodeNpub     string `json:"node_npub"`
+			NodePubkey   string `json:"node_pubkey"`
+			AdminNpub    string `json:"admin_npub"`
+			GenesisBlock int64  `json:"genesis_block"`
+			Network      string `json:"network"`
 		}
 		if jsonErr := json.Unmarshal(body, &info); jsonErr != nil {
 			err = fmt.Errorf("invalid JSON from %s: %w", address, jsonErr)
@@ -1993,6 +1996,22 @@ func (s *Syncer) verifyNodeEndpoint(address string) (npub string, pubkey string,
 		if info.NodeNpub == "" && info.NodePubkey == "" {
 			err = fmt.Errorf("no node identity in response from %s", address)
 			continue
+		}
+
+		// Check 1: Genesis block must be present and must match ours
+		ourGenesis := constants.GetGenesisBlock(s.config.Network)
+		if info.GenesisBlock == 0 {
+			return "", "", "", fmt.Errorf("peer %s does not report genesis_block (incompatible node)", address)
+		}
+		if info.GenesisBlock != ourGenesis {
+			return "", "", "", fmt.Errorf("genesis mismatch with peer %s: peer=%d (network=%s), ours=%d (network=%s)",
+				address, info.GenesisBlock, info.Network, ourGenesis, s.config.Network)
+		}
+		log.Printf("✓ Peer %s genesis matches: %d (network=%s)", address, info.GenesisBlock, info.Network)
+
+		// Check 2: Random data spot-check — verify peer has the same transaction data
+		if spotErr := s.spotCheckPeerData(address, client); spotErr != nil {
+			return "", "", "", fmt.Errorf("data spot-check failed for peer %s: %w", address, spotErr)
 		}
 
 		// Convert admin npub to hex pubkey if present
@@ -2007,6 +2026,78 @@ func (s *Syncer) verifyNodeEndpoint(address string) (npub string, pubkey string,
 	}
 
 	return "", "", "", fmt.Errorf("verification failed after 3 attempts for %s: %w", address, err)
+}
+
+// spotCheckPeerData picks a random transaction from our database and verifies the peer has
+// the same data. This detects malicious nodes that may fake identity but serve different data.
+func (s *Syncer) spotCheckPeerData(address string, client *http.Client) error {
+	qb := database.NewQueryBuilder(s.db)
+
+	// Get a random transaction from our database
+	ourTx, err := qb.GetRandomBitcoinTransaction()
+	if err != nil {
+		// No transactions in our database yet — skip spot-check (new node)
+		log.Printf("⚠ Skipping spot-check for %s (no local transactions yet)", address)
+		return nil
+	}
+
+	// Query the peer's API for this transaction
+	searchURL := fmt.Sprintf("%s/dnn/anchors?search=%s&limit=1",
+		strings.TrimRight(address, "/"), ourTx.TransactionID)
+
+	resp, err := client.Get(searchURL)
+	if err != nil {
+		return fmt.Errorf("failed to query peer: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("peer returned HTTP %d for spot-check", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read spot-check response: %w", err)
+	}
+
+	// Parse the paginated response
+	var peerResult struct {
+		Items []struct {
+			TransactionID string `json:"transaction_id"`
+			BitcoinBlock  int64  `json:"bitcoin_block"`
+			Address       string `json:"bitcoin_address"`
+			DNNBlock      int64  `json:"dnn_block"`
+			Position      int    `json:"position"`
+		} `json:"items"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(body, &peerResult); err != nil {
+		return fmt.Errorf("invalid spot-check response: %w", err)
+	}
+
+	// Peer should have this transaction
+	if peerResult.Total == 0 || len(peerResult.Items) == 0 {
+		// Peer might not have synced this block yet — not necessarily malicious
+		log.Printf("⚠ Spot-check: peer %s doesn't have tx %s yet (may still be syncing)", address, ourTx.TransactionID[:16])
+		return nil
+	}
+
+	// Verify the data matches
+	peerTx := peerResult.Items[0]
+	if peerTx.TransactionID != ourTx.TransactionID {
+		return fmt.Errorf("spot-check txid mismatch: expected %s, got %s", ourTx.TransactionID, peerTx.TransactionID)
+	}
+	if peerTx.BitcoinBlock != ourTx.BitcoinBlock {
+		return fmt.Errorf("spot-check bitcoin_block mismatch for tx %s: ours=%d, peer=%d",
+			ourTx.TransactionID[:16], ourTx.BitcoinBlock, peerTx.BitcoinBlock)
+	}
+	if peerTx.Address != ourTx.BitcoinAddress {
+		return fmt.Errorf("spot-check address mismatch for tx %s: ours=%s, peer=%s",
+			ourTx.TransactionID[:16], ourTx.BitcoinAddress, peerTx.Address)
+	}
+
+	log.Printf("✓ Spot-check passed for peer %s (tx %s matches)", address, ourTx.TransactionID[:16])
+	return nil
 }
 
 // startPeerHealthChecks runs periodic health checks on all stored peers.
