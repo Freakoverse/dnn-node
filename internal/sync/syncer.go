@@ -28,9 +28,10 @@ import (
 type Syncer struct {
 	config       *config.Config
 	db           *database.Database
-	bitcoinP2P   *bitcoin.P2PClient
-	policy       *policy.PolicyEnforcer
-	reorgHandler *reorg.ReorgHandler // Handles blockchain reorganizations
+	bitcoinP2P     *bitcoin.P2PClient
+	restValidator  *bitcoin.RestClient  // Independent REST API for cross-validation
+	policy         *policy.PolicyEnforcer
+	reorgHandler   *reorg.ReorgHandler // Handles blockchain reorganizations
 
 	mu         sync.RWMutex
 	peers      map[string]*PeerNode
@@ -76,44 +77,57 @@ func New(cfg *config.Config, db *database.Database) (*Syncer, error) {
 	var btcP2P *bitcoin.P2PClient
 
 	if cfg.BitcoinRPC.UseP2P {
-		// Use Bitcoin P2P protocol mode (100% decentralized)
-		log.Println("Using Bitcoin P2P protocol (100% decentralized, no REST API)")
+		log.Println("Using Bitcoin P2P protocol with REST cross-validation")
 
-		// Create P2P client without REST fallback
-		btcP2P = bitcoin.NewP2PClient(false, cfg.BitcoinRPC.P2PPeers, nil)
+		// Create REST client for independent cross-validation of block hashes
+		restValidator := bitcoin.NewMempoolSpaceClient()
 
-		// Start P2P client
+		// Create P2P client with REST fallback for cross-checks
+		btcP2P = bitcoin.NewP2PClient(false, cfg.BitcoinRPC.P2PPeers, restValidator)
+
 		if err := btcP2P.Start(); err != nil {
 			log.Printf("Warning: Failed to start Bitcoin P2P client: %v", err)
 			btcP2P = nil
 		} else {
-			// Set persistent tx index store (database)
-			// This allows tx-to-block mappings to survive restarts
 			btcP2P.SetTxIndexStore(db)
 		}
-	} else {
-		log.Println("Bitcoin sync disabled - enable P2P mode in config.json")
-		btcP2P = nil
+
+		syncer := &Syncer{
+			config:        cfg,
+			db:            db,
+			bitcoinP2P:    btcP2P,
+			restValidator: restValidator,
+			policy:        policy.NewPolicyEnforcer(cfg.Network),
+			peers:         make(map[string]*PeerNode),
+			shutdown:      make(chan struct{}),
+			relayConns:    make(map[string]*nostr.Relay),
+		}
+
+		// Initialize reorg handler if Bitcoin P2P is available
+		if btcP2P != nil {
+			syncer.reorgHandler = reorg.NewReorgHandler(db, btcP2P, cfg.Network)
+			log.Println("Reorg handler initialized - will check every 144 DNN blocks")
+		}
+
+		// Register the anchor fetch hook
+		hookManager := database.NewHookManager()
+		hookManager.Register(database.NewAnchorFetchHook(syncer.fetchAndStoreReferencedEvents))
+		db.SetHookManager(hookManager)
+
+		return syncer, nil
 	}
 
+	// Bitcoin sync disabled
+	log.Println("Bitcoin sync disabled - enable P2P mode in config.json")
 	syncer := &Syncer{
 		config:     cfg,
 		db:         db,
-		bitcoinP2P: btcP2P,
 		policy:     policy.NewPolicyEnforcer(cfg.Network),
 		peers:      make(map[string]*PeerNode),
 		shutdown:   make(chan struct{}),
 		relayConns: make(map[string]*nostr.Relay),
 	}
 
-	// Initialize reorg handler if Bitcoin P2P is available
-	if btcP2P != nil {
-		syncer.reorgHandler = reorg.NewReorgHandler(db, btcP2P, cfg.Network)
-		log.Println("Reorg handler initialized - will check every 144 DNN blocks")
-	}
-
-	// Register the anchor fetch hook
-	// This hook will be called by StoreAnchorEvent to fetch referenced events
 	hookManager := database.NewHookManager()
 	hookManager.Register(database.NewAnchorFetchHook(syncer.fetchAndStoreReferencedEvents))
 	db.SetHookManager(hookManager)
@@ -295,15 +309,30 @@ func (s *Syncer) syncBitcoin() error {
 	log.Printf("Processing blocks %d to %d", lastSyncedBlock+1, endBlock)
 
 	for blockNum := lastSyncedBlock + 1; blockNum <= endBlock; blockNum++ {
-		// P2P mode has NO rate limits - no delay needed!
 
 		// Get block hash via P2P
 		blockHash, err := s.bitcoinP2P.GetBlockHash(blockNum)
 		if err != nil {
 			log.Printf("Failed to get block hash for %d: %v (STOPPING to prevent gaps, will retry next sync)", blockNum, err)
-			// CRITICAL: Stop processing here to prevent skipping this block
-			// We've updated sync state up to lastSuccessfulBlock, so next sync will retry from blockNum
 			break
+		}
+
+		// REST CROSS-VALIDATION: Spot-check P2P hashes against independent REST API
+		// Check every 100th block + first block of each batch to catch chain divergence early
+		if s.restValidator != nil && (blockNum == lastSyncedBlock+1 || blockNum%100 == 0) {
+			restHash, restErr := s.restValidator.GetBlockHash(blockNum)
+			if restErr == nil && restHash != blockHash {
+				log.Printf("⚠️ CHAIN DIVERGENCE DETECTED at block %d!", blockNum)
+				log.Printf("   P2P hash:  %s", blockHash)
+				log.Printf("   REST hash: %s", restHash)
+				log.Printf("   Clearing headerCache and aborting sync to recover...")
+				// Clear the corrupted P2P headerCache to force re-sync from checkpoint
+				s.bitcoinP2P.ClearHeaderCache()
+				return fmt.Errorf("chain divergence at block %d: P2P=%s REST=%s", blockNum, blockHash[:16], restHash[:16])
+			} else if restErr == nil {
+				log.Printf("✓ Block %d hash cross-validated against REST API", blockNum)
+			}
+			// If REST fails, just continue with P2P data (REST is optional safety net)
 		}
 
 		// Get block data via P2P with input addresses

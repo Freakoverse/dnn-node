@@ -12,18 +12,20 @@ import (
 
 // ReorgHandler handles blockchain reorganizations
 type ReorgHandler struct {
-	db         *database.Database
-	blockchain bitcoin.BlockchainProvider
-	policy     *policy.PolicyEnforcer
+	db            *database.Database
+	blockchain    bitcoin.BlockchainProvider
+	restValidator *bitcoin.RestClient // Independent REST API for cross-validation
+	policy        *policy.PolicyEnforcer
 }
 
 // NewReorgHandler creates a new reorg handler
 // blockchain can be either *bitcoin.Client (RPC) or *bitcoin.P2PClient
 func NewReorgHandler(db *database.Database, blockchain bitcoin.BlockchainProvider, networkMode string) *ReorgHandler {
 	return &ReorgHandler{
-		db:         db,
-		blockchain: blockchain,
-		policy:     policy.NewPolicyEnforcer(networkMode),
+		db:            db,
+		blockchain:    blockchain,
+		restValidator: bitcoin.NewMempoolSpaceClient(), // Independent verification source
+		policy:        policy.NewPolicyEnforcer(networkMode),
 	}
 }
 
@@ -60,11 +62,19 @@ func (rh *ReorgHandler) CheckAndHandleReorg(currentDNNBlock int64) error {
 			continue
 		}
 
-		// Get current hash from Bitcoin node
-		currentHash, err := rh.blockchain.GetBlockHash(blockNum)
-		if err != nil {
-			log.Printf("Warning: Failed to get hash for block %d: %v", blockNum, err)
-			continue
+		// Get current hash — prefer independent REST API, fall back to P2P
+		var currentHash string
+		var hashErr error
+		if rh.restValidator != nil {
+			currentHash, hashErr = rh.restValidator.GetBlockHash(blockNum)
+		}
+		if hashErr != nil || currentHash == "" {
+			// REST failed or unavailable, fall back to P2P
+			currentHash, hashErr = rh.blockchain.GetBlockHash(blockNum)
+			if hashErr != nil {
+				log.Printf("Warning: Failed to get hash for block %d: %v", blockNum, hashErr)
+				continue
+			}
 		}
 
 		// Compare hashes

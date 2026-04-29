@@ -48,7 +48,7 @@ type P2PClient struct {
 	txIndexStore      TxIndexStore      // Persistent storage for tx index (optional)
 	mu                sync.RWMutex
 	blockChan         chan *wire.MsgBlock
-	headersChan       chan *wire.MsgHeaders
+	pendingHeaders    map[string]chan *wire.MsgHeaders // peerAddr → response channel (per-peer, no cross-contamination)
 	txChan            chan *wire.MsgTx
 	currentHeight     int64
 	heightCacheTime   time.Time                      // When currentHeight was last updated
@@ -92,7 +92,7 @@ func NewP2PClient(testnet bool, peerAddrs []string, restFallback *RestClient) *P
 		blockHashToHeight: make(map[string]int64),
 		txToBlockHash:     make(map[string]string),
 		blockChan:         make(chan *wire.MsgBlock, 10),
-		headersChan:       make(chan *wire.MsgHeaders, 10),
+		pendingHeaders:    make(map[string]chan *wire.MsgHeaders),
 		txChan:            make(chan *wire.MsgTx, 10),
 		currentHeight:     0,
 		RestFallback:      restFallback,
@@ -263,15 +263,23 @@ func (p *P2PClient) onBlock(peer *peer.Peer, msg *wire.MsgBlock, buf []byte) {
 	}
 }
 
-// onHeaders handles headers messages
-func (p *P2PClient) onHeaders(peer *peer.Peer, msg *wire.MsgHeaders) {
-	log.Printf("Received headers message with %d headers from peer", len(msg.Headers))
-	select {
-	case p.headersChan <- msg:
-		log.Printf("Headers queued for processing")
-	default:
-		log.Printf("Headers channel full, dropping headers")
+// onHeaders handles headers messages — routes to per-peer channel
+func (p *P2PClient) onHeaders(pr *peer.Peer, msg *wire.MsgHeaders) {
+	peerAddr := pr.Addr()
+	p.mu.Lock()
+	if respChan, exists := p.pendingHeaders[peerAddr]; exists {
+		delete(p.pendingHeaders, peerAddr)
+		p.mu.Unlock()
+		select {
+		case respChan <- msg:
+			log.Printf("Headers (%d) delivered to request for peer %s", len(msg.Headers), peerAddr)
+		default:
+			log.Printf("Headers channel full for peer %s, dropping %d headers", peerAddr, len(msg.Headers))
+		}
+		return
 	}
+	p.mu.Unlock()
+	log.Printf("No pending header request for peer %s, dropping %d headers", peerAddr, len(msg.Headers))
 }
 
 // onTx handles incoming transaction messages
@@ -329,8 +337,8 @@ func (p *P2PClient) GetBlockCount() (int64, error) {
 }
 
 // getBlockCountConsensus queries multiple peers and returns median height
-// This prevents a single malicious peer from lying about block height
-// NOTE: Queries peers SEQUENTIALLY to avoid headerCache race conditions
+// Each peer builds headers in an ISOLATED local map to prevent cross-contamination.
+// Only the winning peer's validated headers are merged into the shared cache.
 func (p *P2PClient) getBlockCountConsensus() (int64, error) {
 	p.mu.RLock()
 	numPeers := len(p.peers)
@@ -339,13 +347,11 @@ func (p *P2PClient) getBlockCountConsensus() (int64, error) {
 		return 0, fmt.Errorf("no connected peers")
 	}
 
-	// Query up to 3 peers for consensus (reduced for sequential)
 	maxPeersToQuery := 3
 	if numPeers < maxPeersToQuery {
 		maxPeersToQuery = numPeers
 	}
 
-	// Copy peer list to avoid holding lock during queries
 	peersToQuery := make([]*peer.Peer, maxPeersToQuery)
 	for i := 0; i < maxPeersToQuery; i++ {
 		peersToQuery[i] = p.peers[(p.nextPeerIndex+i)%numPeers]
@@ -353,19 +359,24 @@ func (p *P2PClient) getBlockCountConsensus() (int64, error) {
 	p.nextPeerIndex += maxPeersToQuery
 	p.mu.RUnlock()
 
-	log.Printf("Querying %d peers for height consensus (sequential)...", maxPeersToQuery)
+	log.Printf("Querying %d peers for height consensus (sequential, isolated)...", maxPeersToQuery)
 
-	// Query peers SEQUENTIALLY to prevent headerCache race conditions
-	var heights []int64
+	type peerResult struct {
+		height       int64
+		localHeaders map[int64]string
+		localH2H     map[string]int64
+		peerAddr     string
+	}
+
+	var results []peerResult
 	for _, selectedPeer := range peersToQuery {
 		peerAddr := selectedPeer.Addr()
-		height, err := p.getBlockCountFromPeer(selectedPeer)
+		height, lh, lh2h, err := p.getBlockCountFromPeer(selectedPeer)
 		if err == nil {
-			heights = append(heights, height)
-			log.Printf("  Peer %s reports height: %d", peerAddr, height)
+			results = append(results, peerResult{height, lh, lh2h, peerAddr})
+			log.Printf("  Peer %s reports height: %d (%d new headers)", peerAddr, height, len(lh))
 			p.recordPeerSuccess(peerAddr)
-			// If we have at least 2 heights agreeing, we can stop early
-			if len(heights) >= 2 {
+			if len(results) >= 2 {
 				break
 			}
 		} else {
@@ -374,11 +385,15 @@ func (p *P2PClient) getBlockCountConsensus() (int64, error) {
 		}
 	}
 
-	if len(heights) == 0 {
+	if len(results) == 0 {
 		return 0, fmt.Errorf("all %d peers failed to respond", maxPeersToQuery)
 	}
 
 	// Sort heights and take median
+	heights := make([]int64, len(results))
+	for i, r := range results {
+		heights[i] = r.height
+	}
 	for i := 0; i < len(heights)-1; i++ {
 		for j := i + 1; j < len(heights); j++ {
 			if heights[i] > heights[j] {
@@ -386,32 +401,50 @@ func (p *P2PClient) getBlockCountConsensus() (int64, error) {
 			}
 		}
 	}
-
 	medianHeight := heights[len(heights)/2]
-	log.Printf("✓ Consensus height: %d (from %d peers: %v)", medianHeight, len(heights), heights)
 
-	// Cache the consensus height
+	// Merge the BEST peer's validated headers into the shared cache
+	var best *peerResult
+	for i := range results {
+		if best == nil || results[i].height >= best.height {
+			best = &results[i]
+		}
+	}
+
 	p.mu.Lock()
+	if best != nil {
+		for ht, hash := range best.localHeaders {
+			p.headerCache[ht] = hash
+		}
+		for hash, ht := range best.localH2H {
+			p.blockHashToHeight[hash] = ht
+		}
+		log.Printf("✓ Merged %d validated headers from peer %s into shared cache", len(best.localHeaders), best.peerAddr)
+	}
 	p.currentHeight = medianHeight
 	p.heightCacheTime = time.Now()
 	p.mu.Unlock()
 
+	log.Printf("✓ Consensus height: %d (from %d peers: %v)", medianHeight, len(heights), heights)
 	return medianHeight, nil
 }
 
-// getBlockCountFromPeer attempts to get block count from a specific peer
-func (p *P2PClient) getBlockCountFromPeer(selectedPeer *peer.Peer) (int64, error) {
-	// Start from a known checkpoint before genesis
-	// Using block 900,000 as a stable checkpoint (well before our genesis)
+// getBlockCountFromPeer attempts to get block count from a specific peer.
+// Uses LOCAL temporary header storage — never writes to shared headerCache directly.
+// Returns: height, localHeaderCache, localHashToHeight, error
+func (p *P2PClient) getBlockCountFromPeer(selectedPeer *peer.Peer) (int64, map[int64]string, map[string]int64, error) {
+	peerAddr := selectedPeer.Addr()
 	checkpointHeight := int64(900000)
 	checkpointHashStr := "000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
-	// Check if we have cached headers - start from last known position
+	// LOCAL header storage — isolated per peer, never pollutes shared cache
+	localHeaders := make(map[int64]string)
+	localH2H := make(map[string]int64)
+
+	// Resume from shared cache (known-good from prior consensus rounds)
 	p.mu.RLock()
 	var currentHeight int64
 	var currentHashStr string
-
-	// Find the highest cached block to resume from
 	highestCached := checkpointHeight
 	for height, hash := range p.headerCache {
 		if height > highestCached && height >= checkpointHeight {
@@ -423,130 +456,97 @@ func (p *P2PClient) getBlockCountFromPeer(selectedPeer *peer.Peer) (int64, error
 
 	if currentHashStr != "" {
 		currentHeight = highestCached + 1
-		log.Printf("Resuming from cached block %d (hash: %s...)", highestCached, currentHashStr[:16])
+		log.Printf("  [%s] Resuming from cached block %d", peerAddr, highestCached)
 	} else {
 		currentHeight = checkpointHeight + 1
 		currentHashStr = checkpointHashStr
-		log.Printf("Starting from checkpoint block %d (hash: %s...)", checkpointHeight, checkpointHashStr[:16])
+		log.Printf("  [%s] Starting from checkpoint block %d", peerAddr, checkpointHeight)
 	}
 
-	// IMPORTANT: GetHeaders returns headers AFTER the locator block, so first header
-	// will be block 900001. Start counting from checkpoint + 1.
-
-	// Keep requesting headers until we reach the tip
 	for {
 		currentHash, err := chainhash.NewHashFromStr(currentHashStr)
 		if err != nil {
-			return 0, fmt.Errorf("invalid hash: %w", err)
+			return 0, nil, nil, fmt.Errorf("invalid hash: %w", err)
 		}
 
-		// IMPORTANT: Drain any stale headers from previous requests/timeouts
-		// This prevents double-counting when late headers arrive after timeout
-	drainLoop:
-		for {
-			select {
-			case <-p.headersChan:
-				log.Printf("  Drained stale headers message from channel")
-			default:
-				break drainLoop
-			}
-		}
+		// Register per-peer header response channel
+		respChan := make(chan *wire.MsgHeaders, 1)
+		p.mu.Lock()
+		p.pendingHeaders[peerAddr] = respChan
+		p.mu.Unlock()
 
 		getHeaders := wire.NewMsgGetHeaders()
 		getHeaders.AddBlockLocatorHash(currentHash)
-		log.Printf("Sending getheaders request for block %s...", currentHashStr[:16])
 		selectedPeer.QueueMessage(getHeaders, nil)
 
-		// Wait for headers
 		timeout := time.After(5 * time.Second)
-		log.Printf("Waiting for headers response (5s timeout)...")
 		select {
-		case headers := <-p.headersChan:
+		case headers := <-respChan:
 			if len(headers.Headers) == 0 {
-				// No more headers - we've reached the tip
-				p.mu.Lock()
-				p.currentHeight = currentHeight - 1
-				p.heightCacheTime = time.Now()
-				p.mu.Unlock()
-				log.Printf("✓ Current block height: %d (reached tip)", currentHeight-1)
-				return currentHeight - 1, nil
+				finalHeight := currentHeight - 1
+				log.Printf("  [%s] ✓ Reached tip at height %d", peerAddr, finalHeight)
+				return finalHeight, localHeaders, localH2H, nil
 			}
 
-			// Cache headers and update current height and hash
-			// IMPORTANT: Validate each header before caching (prevents fake chains)
-			p.mu.Lock()
-			prevHashStr := currentHashStr // Track previous hash for chain validation
+			// Validate each header before storing in LOCAL cache
+			prevHashStr := currentHashStr
 			invalidFound := false
 			for _, header := range headers.Headers {
 				hash := header.BlockHash()
 				hashStr := hash.String()
 
-				// Validate header: check prev_hash links to previous block
-				// Use string comparison to avoid struct comparison issues
+				// Validate prev_hash chain linkage
 				if header.PrevBlock.String() != prevHashStr {
-					log.Printf("⚠️ INVALID HEADER: Block at height %d has wrong prev_hash!", currentHeight)
-					log.Printf("   Expected prev: %s", prevHashStr)
-					log.Printf("   Got prev: %s", header.PrevBlock.String())
+					log.Printf("  [%s] ⚠️ INVALID HEADER at height %d: wrong prev_hash!", peerAddr, currentHeight)
 					invalidFound = true
 					break
 				}
 
-				// Validate proof of work: block hash must be less than target
-				// The hash is already in little-endian, just check leading zeros
-				// A valid Bitcoin block hash has many leading zeros
-				// For mainnet, difficulty is so high that blocks have ~19+ leading zero bits
+				// Validate proof of work (leading zeros check)
 				hashBytes := hash.CloneBytes()
 				leadingZeros := 0
 				for i := len(hashBytes) - 1; i >= 0; i-- {
 					if hashBytes[i] == 0 {
 						leadingZeros += 8
 					} else {
-						// Count leading zero bits in this byte
 						for b := uint8(0x80); b > 0 && hashBytes[i]&b == 0; b >>= 1 {
 							leadingZeros++
 						}
 						break
 					}
 				}
-				// Mainnet blocks since 2020 have hash with at least 70 leading zero bits
-				// We use a conservative threshold of 60 to avoid false positives
 				if leadingZeros < 60 {
-					log.Printf("⚠️ INVALID HEADER: Block %s fails PoW check (only %d leading zeros)", hashStr[:16], leadingZeros)
+					log.Printf("  [%s] ⚠️ INVALID HEADER: block %s fails PoW (%d leading zeros)", peerAddr, hashStr[:16], leadingZeros)
 					invalidFound = true
 					break
 				}
 
-				// Header is valid - cache it
-				p.headerCache[currentHeight] = hashStr
-				p.blockHashToHeight[hashStr] = currentHeight
-
+				// Valid — store in LOCAL cache only
+				localHeaders[currentHeight] = hashStr
+				localH2H[hashStr] = currentHeight
 				prevHashStr = hashStr
 				currentHashStr = hashStr
 				currentHeight++
 			}
-			p.mu.Unlock()
 
-			// If invalid headers found, reject this peer's response
 			if invalidFound {
-				return 0, fmt.Errorf("peer sent invalid headers - possible attack")
+				return 0, nil, nil, fmt.Errorf("peer %s sent invalid headers", peerAddr)
 			}
 
-			// If we got less than 2000 headers, we've reached the tip
 			if len(headers.Headers) < 2000 {
-				p.mu.Lock()
-				p.currentHeight = currentHeight - 1
-				p.heightCacheTime = time.Now()
-				p.mu.Unlock()
-				log.Printf("✓ Current block height: %d (from headers)", currentHeight-1)
-				return currentHeight - 1, nil
+				finalHeight := currentHeight - 1
+				log.Printf("  [%s] ✓ Current height: %d (from headers)", peerAddr, finalHeight)
+				return finalHeight, localHeaders, localH2H, nil
 			}
 
-			// Got full batch of 2000, continue to next batch
-			log.Printf("  Got batch of %d headers (now at ~%d), requesting more...", len(headers.Headers), currentHeight-1)
+			log.Printf("  [%s] Got batch of %d headers (now at ~%d), more...", peerAddr, len(headers.Headers), currentHeight-1)
 
 		case <-timeout:
-			// Return error to trigger peer rotation in parent function
-			return 0, fmt.Errorf("timeout waiting for headers")
+			// Clean up pending registration
+			p.mu.Lock()
+			delete(p.pendingHeaders, peerAddr)
+			p.mu.Unlock()
+			return 0, nil, nil, fmt.Errorf("timeout waiting for headers from %s", peerAddr)
 		}
 	}
 }
@@ -581,6 +581,7 @@ func (p *P2PClient) GetBlockHash(height int64) (string, error) {
 }
 
 // syncHeadersToHeight syncs block headers up to the specified height
+// Now validates each header (prev_hash chain linkage + PoW) before caching
 func (p *P2PClient) syncHeadersToHeight(targetHeight int64) error {
 	// Select a peer using round-robin
 	p.mu.Lock()
@@ -595,64 +596,93 @@ func (p *P2PClient) syncHeadersToHeight(targetHeight int64) error {
 
 	log.Printf("Using peer %s for header sync to height %d", peerAddr, targetHeight)
 
-	// Start from a known checkpoint (block 900,000)
-	// This is before our genesis so we can build headers up to current genesis
 	checkpointHeight := int64(900000)
 	checkpointHashStr := "000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a"
 
-	// IMPORTANT: When requesting headers with a block locator, the Bitcoin protocol
-	// returns headers STARTING FROM THE NEXT BLOCK after the locator.
-	// So if we request headers from block 900000, we get headers for 900001, 900002, etc.
-	// Therefore, currentHeight should start at checkpoint + 1.
+	// Resume from the highest cached header (if available)
+	p.mu.RLock()
 	currentHeight := checkpointHeight + 1
 	currentHashStr := checkpointHashStr
+	highestCached := checkpointHeight
+	for height, hash := range p.headerCache {
+		if height > highestCached && height >= checkpointHeight {
+			highestCached = height
+			currentHashStr = hash
+		}
+	}
+	if highestCached > checkpointHeight {
+		currentHeight = highestCached + 1
+	}
+	p.mu.RUnlock()
 
-	log.Printf("Syncing headers from block %d to %d...", checkpointHeight+1, targetHeight)
-
+	log.Printf("Syncing headers from block %d to %d...", currentHeight, targetHeight)
 	totalHeadersSynced := 0
 
-	// Keep requesting headers until we reach target height
-	// Each request can return up to 2000 headers
 	for currentHeight <= targetHeight {
 		currentHash, err := chainhash.NewHashFromStr(currentHashStr)
 		if err != nil {
 			return fmt.Errorf("invalid hash: %w", err)
 		}
 
-		// IMPORTANT: Drain any stale headers from previous requests/timeouts
-	drainLoop2:
-		for {
-			select {
-			case <-p.headersChan:
-				log.Printf("  Drained stale headers message from channel")
-			default:
-				break drainLoop2
-			}
-		}
+		// Register per-peer header response channel
+		respChan := make(chan *wire.MsgHeaders, 1)
+		p.mu.Lock()
+		p.pendingHeaders[peerAddr] = respChan
+		p.mu.Unlock()
 
-		// Request next batch of headers
 		getHeaders := wire.NewMsgGetHeaders()
 		getHeaders.AddBlockLocatorHash(currentHash)
-
 		selectedPeer.QueueMessage(getHeaders, nil)
 
-		// Wait for headers response
 		timeout := time.After(5 * time.Second)
 		select {
-		case headers := <-p.headersChan:
+		case headers := <-respChan:
 			if len(headers.Headers) == 0 {
 				log.Printf("✓ Synced %d total headers (reached tip at block %d)", totalHeadersSynced, currentHeight-1)
 				return nil
 			}
 
+			// Validate and cache headers
 			p.mu.Lock()
-			// Process headers and build height->hash and hash->height mappings
+			prevHashStr := currentHashStr
+			invalidFound := false
 			for _, header := range headers.Headers {
 				hash := header.BlockHash()
 				hashStr := hash.String()
+
+				// Validate prev_hash chain linkage
+				if header.PrevBlock.String() != prevHashStr {
+					log.Printf("⚠️ INVALID HEADER in syncHeaders at height %d: wrong prev_hash!", currentHeight)
+					log.Printf("   Expected prev: %s", prevHashStr)
+					log.Printf("   Got prev: %s", header.PrevBlock.String())
+					invalidFound = true
+					break
+				}
+
+				// Validate proof of work
+				hashBytes := hash.CloneBytes()
+				leadingZeros := 0
+				for i := len(hashBytes) - 1; i >= 0; i-- {
+					if hashBytes[i] == 0 {
+						leadingZeros += 8
+					} else {
+						for b := uint8(0x80); b > 0 && hashBytes[i]&b == 0; b >>= 1 {
+							leadingZeros++
+						}
+						break
+					}
+				}
+				if leadingZeros < 60 {
+					log.Printf("⚠️ INVALID HEADER in syncHeaders: block %s fails PoW (%d leading zeros)", hashStr[:16], leadingZeros)
+					invalidFound = true
+					break
+				}
+
+				// Header is valid — cache it
 				p.headerCache[currentHeight] = hashStr
-				p.blockHashToHeight[hashStr] = currentHeight // Reverse mapping
-				currentHashStr = hashStr                     // Update for next batch
+				p.blockHashToHeight[hashStr] = currentHeight
+				prevHashStr = hashStr
+				currentHashStr = hashStr
 				currentHeight++
 				totalHeadersSynced++
 
@@ -662,27 +692,38 @@ func (p *P2PClient) syncHeadersToHeight(targetHeight int64) error {
 			}
 			p.mu.Unlock()
 
-			log.Printf("  Synced batch of %d headers (now at block %d)", len(headers.Headers), currentHeight-1)
-
-			// If we got less than 2000 headers, we've reached the tip
-			if len(headers.Headers) < 2000 {
-				log.Printf("✓ Synced %d total headers (reached tip)", totalHeadersSynced)
-				return nil
+			if invalidFound {
+				// Rotate to next peer and retry
+				p.recordPeerFailure(peerAddr)
+				p.mu.Lock()
+				if len(p.peers) == 0 {
+					p.mu.Unlock()
+					return fmt.Errorf("no connected peers after invalid headers")
+				}
+				selectedPeer = p.peers[p.nextPeerIndex%len(p.peers)]
+				p.nextPeerIndex++
+				peerAddr = selectedPeer.Addr()
+				p.mu.Unlock()
+				log.Printf("Rotating to peer %s after invalid headers...", peerAddr)
+				continue
 			}
 
-			// If we've reached target, stop
-			if currentHeight > targetHeight {
-				log.Printf("✓ Synced %d total headers (reached target height %d)", totalHeadersSynced, targetHeight)
+			log.Printf("  Synced batch of %d headers (now at block %d)", len(headers.Headers), currentHeight-1)
+
+			if len(headers.Headers) < 2000 || currentHeight > targetHeight {
+				log.Printf("✓ Synced %d total headers (reached target)", totalHeadersSynced)
 				return nil
 			}
 
 		case <-timeout:
-			log.Printf("⚠️ Timeout waiting for headers at height %d from peer %s - rotating to next peer...", currentHeight, peerAddr)
+			log.Printf("⚠️ Timeout waiting for headers at height %d from peer %s", currentHeight, peerAddr)
 
-			// Record failure for this peer
+			// Clean up and rotate
+			p.mu.Lock()
+			delete(p.pendingHeaders, peerAddr)
+			p.mu.Unlock()
 			p.recordPeerFailure(peerAddr)
 
-			// Select next peer and retry this batch
 			p.mu.Lock()
 			if len(p.peers) == 0 {
 				p.mu.Unlock()
@@ -694,7 +735,6 @@ func (p *P2PClient) syncHeadersToHeight(targetHeight int64) error {
 			p.mu.Unlock()
 
 			log.Printf("Retrying with peer %s...", peerAddr)
-			// Continue the loop to retry with new peer
 		}
 	}
 
@@ -1361,6 +1401,21 @@ func (p *P2PClient) Stop() {
 
 	p.peers = nil
 	log.Println("Bitcoin P2P client stopped")
+}
+
+// ClearHeaderCache wipes the in-memory header cache, forcing resync from checkpoint.
+// Called when chain divergence is detected to discard potentially corrupted headers.
+func (p *P2PClient) ClearHeaderCache() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	cacheSize := len(p.headerCache)
+	p.headerCache = make(map[int64]string)
+	p.blockHashToHeight = make(map[string]int64)
+	p.currentHeight = 0
+	p.heightCacheTime = time.Time{}
+
+	log.Printf("⚠️ Header cache cleared (%d entries removed) — will resync from checkpoint", cacheSize)
 }
 
 // GetBlockHashForTransaction returns the block hash containing a transaction
