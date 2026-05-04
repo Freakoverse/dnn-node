@@ -467,13 +467,20 @@ func (qb *QueryBuilder) GetBlockAnchors(blockNumber int64) ([]AnchorRecord, erro
 			).Scan(&connectionContent)
 		}
 
-		// Fetch metadata event
-		_, _, metaPubkey, _, err := extractEventIDFromNaddr(metaEventRef)
+		// Fetch metadata event - use both pubkey AND d_tag, get latest version
+		_, _, metaPubkey, metaDTag, err := extractEventIDFromNaddr(metaEventRef)
 		if err == nil {
-			_ = qb.db.db.QueryRow(
-				"SELECT content FROM metadata_events WHERE pubkey = ? LIMIT 1",
-				metaPubkey,
-			).Scan(&metadataContent)
+			if metaDTag != "" {
+				_ = qb.db.db.QueryRow(
+					"SELECT content FROM metadata_events WHERE pubkey = ? AND d_tag = ? ORDER BY created_at DESC LIMIT 1",
+					metaPubkey, metaDTag,
+				).Scan(&metadataContent)
+			} else {
+				_ = qb.db.db.QueryRow(
+					"SELECT content FROM metadata_events WHERE pubkey = ? ORDER BY created_at DESC LIMIT 1",
+					metaPubkey,
+				).Scan(&metadataContent)
+			}
 		}
 
 		a := AnchorRecord{

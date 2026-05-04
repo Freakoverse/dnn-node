@@ -1487,13 +1487,20 @@ func (d *Database) GetAnchorByName(name string, blockNum *int64, position *int) 
 		log.Printf("[DB] Warning: Failed to decode connection_event_ref: %v", err)
 	}
 
-	// Fetch metadata event
-	_, _, metaPubkey, _, err := extractEventIDFromNaddr(metaEventRef)
+	// Fetch metadata event - use both pubkey AND d_tag, get latest version
+	_, _, metaPubkey, metaDTag, err := extractEventIDFromNaddr(metaEventRef)
 	if err == nil {
-		err = d.db.QueryRow(
-			"SELECT content FROM metadata_events WHERE pubkey = ? LIMIT 1",
-			metaPubkey,
-		).Scan(&metadataContent)
+		if metaDTag != "" {
+			err = d.db.QueryRow(
+				"SELECT content FROM metadata_events WHERE pubkey = ? AND d_tag = ? ORDER BY created_at DESC LIMIT 1",
+				metaPubkey, metaDTag,
+			).Scan(&metadataContent)
+		} else {
+			err = d.db.QueryRow(
+				"SELECT content FROM metadata_events WHERE pubkey = ? ORDER BY created_at DESC LIMIT 1",
+				metaPubkey,
+			).Scan(&metadataContent)
+		}
 		if err != nil {
 			log.Printf("[DB] Warning: Metadata event not found for naddr %s: %v", metaEventRef, err)
 		}
@@ -1588,13 +1595,20 @@ func (d *Database) GetNamesByPubkey(pubkey string) ([]*AnchorRecord, error) {
 			).Scan(&connectionContent)
 		}
 
-		// Fetch metadata event
-		_, _, metaPubkey, _, err := extractEventIDFromNaddr(metaEventRef)
+		// Fetch metadata event - use both pubkey AND d_tag, get latest version
+		_, _, metaPubkey, metaDTag, err := extractEventIDFromNaddr(metaEventRef)
 		if err == nil {
-			_ = d.db.QueryRow(
-				"SELECT content FROM metadata_events WHERE pubkey = ? LIMIT 1",
-				metaPubkey,
-			).Scan(&metadataContent)
+			if metaDTag != "" {
+				_ = d.db.QueryRow(
+					"SELECT content FROM metadata_events WHERE pubkey = ? AND d_tag = ? ORDER BY created_at DESC LIMIT 1",
+					metaPubkey, metaDTag,
+				).Scan(&metadataContent)
+			} else {
+				_ = d.db.QueryRow(
+					"SELECT content FROM metadata_events WHERE pubkey = ? ORDER BY created_at DESC LIMIT 1",
+					metaPubkey,
+				).Scan(&metadataContent)
+			}
 		}
 
 		record := &AnchorRecord{
